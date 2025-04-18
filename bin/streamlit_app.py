@@ -1,86 +1,111 @@
-import streamlit as st
-import pandas as pd
-import sqlite3
-import os
-import sys
+
+import sys, os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+import streamlit as st
+import sqlite3
+import pandas as pd
+from datetime import datetime
 from commands.import_from_excel import import_from_excel
 
-DB_PATH = 'data/podcasts.db'
+DB_PATH = "data/podcasts.db"
+SUMMARY_PATH = "logs/import_summary.txt"
 
-st.set_page_config(layout="wide", page_title="Podcast Trends")
+def apply_sidebar_filters(df):
+    st.sidebar.title("🔍 Filters")
+    features = df["feature"].dropna().unique().tolist()
+    selected_features = st.sidebar.multiselect("Feature(s)", sorted(features))
 
-st.title("🎙️ Podcast Analytics Explorer")
+    years = df["year"].dropna().unique().astype(int)
+    selected_years = st.sidebar.multiselect("Year(s)", sorted(years, reverse=True))
 
-tabs = st.tabs(["Explore Data", "Raw Table View", "Upload Data", "Chart View"])
-tab1, tab2, tab3, tab4 = tabs
+    df = df[df["date"].notnull()]
+    min_date = df["date"].min()
+    max_date = df["date"].max()
+    start_date, end_date = st.sidebar.date_input("Date Range", [min_date, max_date], format="MM/DD/YYYY")
 
-df = None
-if os.path.exists(DB_PATH):
-    conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql("SELECT * FROM podcasts", conn)
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df["year"] = df["date"].dt.year.astype("Int64")
-    df["month"] = df["date"].dt.month.astype("Int64")
+    if selected_features:
+        df = df[df["feature"].isin(selected_features)]
+    if selected_years:
+        df = df[df["year"].isin(selected_years)]
+    if isinstance(start_date, datetime) and isinstance(end_date, datetime):
+        df = df[(df["date"] >= pd.to_datetime(start_date)) & (df["date"] <= pd.to_datetime(end_date))]
 
-with tab1:
+    return df
+
+def show_explore_tab(df):
     st.header("📊 Explore Data")
-    if df is not None and not df.empty:
-        st.markdown("Use filters in the sidebar to explore podcast trends.")
-        with st.sidebar:
-            st.header("📅 Filters")
-            years = st.multiselect("Year", sorted(df['year'].dropna().unique()))
-            months = st.multiselect("Month", sorted(df['month'].dropna().unique()))
-            features = st.multiselect("Feature", sorted(df['feature'].dropna().unique()))
+    display_df = df.copy()
+    display_df["eq_full"] = display_df["eq_full"].apply(lambda x: int(round(x)) if pd.notnull(x) else "n/a")
+    display_df["partial"] = display_df["partial"].apply(lambda x: int(round(x)) if pd.notnull(x) else "n/a")
+    display_df["full"] = display_df["full"].apply(lambda x: int(round(x)) if pd.notnull(x) else "n/a")
+    display_df["code"] = display_df["code"].apply(lambda x: f"{int(x):03}" if pd.notnull(x) else "n/a")
+    display_df["date"] = display_df["date"].dt.strftime("%m-%d-%Y")
+    st.dataframe(display_df[["feature", "title", "date", "code", "eq_full", "full", "partial"]].sort_values("eq_full", ascending=False), use_container_width=True, hide_index=True)
 
-        df_filtered = df.copy()
-        if years:
-            df_filtered = df_filtered[df_filtered["year"].isin(years)]
-        if months:
-            df_filtered = df_filtered[df_filtered["month"].isin(months)]
-        if features:
-            df_filtered = df_filtered[df_filtered["feature"].isin(features)]
-
-        df_filtered = df_filtered.drop(columns=['year', 'month'], errors='ignore')
-        df_filtered[["eq_full", "full", "partial"]] = df_filtered[["eq_full", "full", "partial"]].fillna(0).astype(int)
-
-        if not df_filtered.empty:
-            st.subheader("Top Titles")
-            st.dataframe(
-                df_filtered[["feature", "title", "date", "code", "eq_full", "full", "partial"]]
-                .sort_values("eq_full", ascending=False),
-                use_container_width=True, hide_index=True
-            )
-        else:
-            st.info("No matching results for selected filters.")
-
-with tab2:
+def show_raw_tab(df):
     st.header("🧾 Raw Table View")
-    if df is not None:
-        st.dataframe(df, use_container_width=True)
+    st.dataframe(df)
 
-with tab3:
+def show_trend_tab(df):
+    st.header("📈 Trend by Title")
+    titles = df["title"].dropna().unique().tolist()
+    selected_title = st.selectbox("Select Title", sorted(titles))
+    trend_df = df[df["title"] == selected_title].sort_values("date")
+    if not trend_df.empty:
+        st.line_chart(trend_df.set_index("date")[["eq_full"]])
+    else:
+        st.warning("No trend data available for this title.")
+
+def show_upload_tab():
     st.header("📤 Upload Data")
-    uploaded_file = st.file_uploader("Upload Excel File", type=["xlsx"])
-    overwrite = st.checkbox("Overwrite database", value=False)
-    if uploaded_file is not None:
-        with open("/tmp/uploaded.xlsx", "wb") as f:
-            f.write(uploaded_file.read())
-        result = import_from_excel("/tmp/uploaded.xlsx", overwrite_db=overwrite)
-        if result:
-            st.success(f"Imported {result.get('rows_imported', 0)} rows with {result.get('duplicates_found', 0)} duplicates.")
+    uploaded_file = st.file_uploader("Upload Excel file", type=["xlsx"])
+    overwrite = st.checkbox("Overwrite existing DB", value=False)
+    if st.button("Run Import"):
+        if uploaded_file:
+            save_path = os.path.join("data", f"uploaded_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+            with open(save_path, "wb") as f:
+                f.write(uploaded_file.read())
+            import_from_excel(save_path, overwrite=overwrite)
+            st.success("✅ Import completed.")
+            if os.path.exists(SUMMARY_PATH):
+                with open(SUMMARY_PATH, "r") as f:
+                    summary = f.read()
+                st.text("Import Summary:")
+                st.code(summary)
         else:
-            st.error("Import failed.")
+            st.warning("⚠️ Please upload a file.")
 
-with tab4:
-    st.header("📈 Chart View")
-    if df is not None and not df.empty:
-        title_input = st.selectbox("Select a title", sorted(df["title"].dropna().unique()))
-        title_df = df[df["title"] == title_input].sort_values("date")
-        if 'eq_full' in title_df.columns:
-            st.line_chart(title_df.set_index("date")["eq_full"])
-            st.markdown("#### 📋 Chart Data Preview")
-            st.dataframe(
-                title_df,
-                use_container_width=True, hide_index=True,
-            )
+def main():
+    st.set_page_config(page_title="Podcast Trends", layout="wide")
+    st.title("🎧 Podcast Trends Dashboard")
+
+    if os.path.exists(DB_PATH):
+        conn = sqlite3.connect(DB_PATH)
+        df = pd.read_sql("SELECT * FROM podcasts", conn)
+        conn.close()
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df["year"] = df["date"].dt.year.astype("Int64")
+    else:
+        df = pd.DataFrame()
+
+    if not df.empty:
+        df = apply_sidebar_filters(df)
+
+    tab1, tab2, tab3, tab4 = st.tabs(["Explore Data", "Raw Table View", "Trend by Title", "Upload Data"])
+    with tab1:
+        if not df.empty:
+            show_explore_tab(df)
+        else:
+            st.info("No data found.")
+    with tab2:
+        if not df.empty:
+            show_raw_tab(df)
+    with tab3:
+        if not df.empty:
+            show_trend_tab(df)
+    with tab4:
+        show_upload_tab()
+
+if __name__ == "__main__":
+    main()

@@ -1,171 +1,121 @@
+
 import pandas as pd
-import os
-import re
-from pathlib import Path
-from collections import defaultdict
+import argparse
 import sqlite3
+import os
+from pathlib import Path
+import re
+import sys
 
-def extract_feature(filename):
-    match = re.search(r"(Mktg_podcast|HPCpodcast|HPCNB|OXD|OXDcast|MktgPodcast|Mktg_Podcast)", filename, re.IGNORECASE)
-    return match.group(1) if match else None
-
-def extract_code(filename):
-    match = re.search(r"(\d{2,3})(?=@)", filename)
-    return match.group(1) if match else None
-
-def extract_date(filename, url):
-    match = re.search(r"(20\d{2})[-_](\d{1,2})", filename)
-    if match:
-        return f"{match.group(1)}-{int(match.group(2)):02d}-01"
-    match = re.search(r"/(20\d{2})/(\d{1,2})/", url)
-    if match:
-        return f"{match.group(1)}-{int(match.group(2)):02d}-01"
+def extract_feature_from_filename(filename: str) -> str | None:
+    lowered = filename.lower()
+    feature_map = {
+        "hpcpodcas": "hpcpodcast",
+        "hpcpodcast": "hpcpodcast",
+        "mktg_podcast": "mktg_podcast",
+        "oxd": "oxd",
+        "hpcnb": "hpcnb"
+    }
+    for key, val in feature_map.items():
+        if key in lowered:
+            return val
     return None
 
-def extract_title(filename):
-    name = Path(filename).stem
-    parts = re.split(r"[_\-]", name)
-    if len(parts) > 5:
-        parts = parts[:5]
-    return "_".join(parts)
 
-def normalize_columns(df):
-    column_map = {}
-    for col in df.columns:
-        col_clean = col.strip().lower()
-        if col_clean == 'url':
-            column_map[col] = 'url'
-        elif 'full' in col_clean:
-            column_map[col] = 'full'
-        elif 'partial' in col_clean:
-            column_map[col] = 'partial'
-        elif 'avg' in col_clean:
-            column_map[col] = 'avg_bw'
-        elif 'total' in col_clean:
-            column_map[col] = 'total_bw'
-    return df.rename(columns=column_map)
+def extract_date(url: str) -> str | None:
+    filename = Path(url).name
+    match_filename = re.search(r"(\d{4})[-_]?(\d{2})[-_]?(\d{2})", filename)
+    if match_filename:
+        return f"{match_filename.group(1)}-{match_filename.group(2)}-{match_filename.group(3)}"
+    match_path = re.search(r"/(\d{4})/(\d{2})/", url)
+    if match_path:
+        return f"{match_path.group(1)}-{match_path.group(2)}-01"
+    return None
 
-def import_from_excel(filepath, overwrite=False):
-    if overwrite and os.path.exists("data/podcasts.db"):
-        os.remove("data/podcasts.db")
-        print("🧨 Existing database deleted due to --overwrite-db flag")
 
-    print(f"📥 Importing from {filepath}")
-    wb = pd.read_excel(filepath, sheet_name=None)
-    seen = {}
-    dedup_buffer = defaultdict(list)
-    output_rows = []
-    skipped = []
-    db_path = "data/podcasts.db"
 
-    for sheet_name, df in wb.items():
-        df = normalize_columns(df)
-        for _, row in df.iterrows():
-            url = str(row.get("url") or "").strip().lower()
-            sheet = str(sheet_name).strip()
-            if "/wp-content/uploads" not in url:
-                skipped.append({**row.to_dict(), "sheet_name": sheet_name, "reason": "invalid url"})
-                continue
+def extract_code_from_filename(url: str) -> int | None:
+    filename = Path(url).name
+    match = re.match(r"^(\d+)[@_]", filename)
+    return int(match.group(1)) if match else None
 
-            dedupe_key = (url, sheet)
-            full = pd.to_numeric(row.get("full"), errors="coerce") or 0
-            partial = pd.to_numeric(row.get("partial"), errors="coerce") or 0
-            avg_bw = pd.to_numeric(row.get("avg_bw"), errors="coerce") or 0
-            total_bw = pd.to_numeric(row.get("total_bw"), errors="coerce") or 0
 
-            filename = os.path.basename(url)
-            feature = extract_feature(filename)
-            code = extract_code(filename)
-            date = extract_date(filename, url)
-            title = extract_title(filename)
+def extract_title_from_filename(url: str) -> str:
+    filename = Path(url).name
+    return re.sub(r'^\d+@', '', filename.split('.')[0])
 
-            if dedupe_key in seen:
-                dedup_buffer[dedupe_key].append((full, partial, avg_bw, total_bw))
-                continue
+def import_from_excel(path: str, db_path: str = "data/podcasts.db", override_db: bool = False):
+    if os.path.exists(db_path) and not override_db:
+        print("❌ Refusing to overwrite existing DB without --override-db")
+        sys.exit(1)
+    elif override_db and os.path.exists(db_path):
+        os.remove(db_path)
 
-            seen[dedupe_key] = True
-            dedup_buffer[dedupe_key].append((full, partial, avg_bw, total_bw))
-            output_rows.append({
-                "url": url,
-                "full": full,
-                "partial": partial,
-                "avg_bw": avg_bw,
-                "total_bw": total_bw,
-                "feature": feature,
-                "code": code,
-                "sheet_name": sheet,
-                "year": int(date[:4]) if date else None,
-                "month": int(date[5:7]) if date else None,
-                "date": date,
-                "title": title
-            })
+    xls = pd.ExcelFile(path)
+    all_rows = []
 
-    for row in output_rows:
-        key = (row["url"], row["sheet_name"])
-        entries = dedup_buffer[key]
-        if len(entries) > 1:
-            row["full"] = sum(e[0] for e in entries)
-            row["partial"] = sum(e[1] for e in entries)
-            row["avg_bw"] = sum(e[2] for e in entries) / len(entries)
-            row["total_bw"] = sum(e[3] for e in entries)
-        row["eq_full"] = row["full"] + 0.5 * row["partial"]
+    for sheet_name in xls.sheet_names:
+        df = xls.parse(sheet_name)
+        df.columns = df.columns.str.strip().str.lower()
+        df['sheet'] = sheet_name
+        all_rows.append(df)
 
-    duplicate_rows = []
-    for key, entries in dedup_buffer.items():
-        if len(entries) > 1:
-            for entry in entries[1:]:
-                duplicate_rows.append({
-                    "url": key[0],
-                    "sheet_name": key[1],
-                    "full": entry[0],
-                    "partial": entry[1],
-                    "avg_bw": entry[2],
-                    "total_bw": entry[3],
-                    "reason": "duplicate in sheet"
-                })
-    if duplicate_rows:
-        pd.DataFrame(duplicate_rows).to_csv("logs/duplicate_rows.csv", index=False)
-    if skipped:
-        pd.DataFrame(skipped).to_csv("logs/skipped_rows.csv", index=False)
+    df = pd.concat(all_rows, ignore_index=True)
 
-    os.makedirs("data", exist_ok=True)
+    skipped_rows = 0
+    processed_rows = []
+
+    for _, row in df.iterrows():
+        url = str(row.get("url", "")).strip()
+        if "/wp-content/uploads" not in url:
+            skipped_rows += 1
+            continue
+
+        try: full = int(float(row.get("full", 0) or 0))
+        except: full = 0
+        try: partial = int(float(row.get("partial", 0) or 0))
+        except: partial = 0
+        try: avg_bw = float(row.get("avg bw", 0) or 0)
+        except: avg_bw = 0.0
+        try: total_bw = float(row.get("total bw", 0) or 0)
+        except: total_bw = 0.0
+
+        processed_rows.append({
+            "url": url,
+            "full": full,
+            "partial": partial,
+            "avg_bw": avg_bw,
+            "total_bw": total_bw,
+            "eq_full": full + 0.5 * partial,
+            "code": extract_code_from_filename(url),
+            "title": extract_title_from_filename(url),
+            "feature": extract_feature_from_filename(url),
+            "date": extract_date(url),
+            "sheet": row["sheet"]
+        })
+
+    clean_df = pd.DataFrame(processed_rows)
+    clean_df["dupe_key"] = clean_df["url"].apply(lambda x: str(x).strip()) + "::" + clean_df["sheet"]
+
+    deduped = clean_df.drop_duplicates(subset='dupe_key').copy()
+    dups = clean_df[clean_df.duplicated('dupe_key', keep=False)]
+
+    if not dups.empty:
+        os.makedirs("logs", exist_ok=True)
+        dups.to_csv("logs/duplicate_rows.csv", index=False)
+
     conn = sqlite3.connect(db_path)
-    c = conn.cursor()
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS podcasts (
-        url TEXT NOT NULL,
-        full INTEGER,
-        partial INTEGER,
-        avg_bw REAL,
-        total_bw REAL,
-        eq_full REAL,
-        feature TEXT,
-        code TEXT,
-        sheet_name TEXT NOT NULL,
-        year INTEGER,
-        month INTEGER,
-        date TEXT,
-        title TEXT,
-        UNIQUE(url, sheet_name)
-    )
-    """)
-    conn.commit()
-
-    inserted_count = 0
-    for row in output_rows:
-        c.execute("""
-        INSERT OR IGNORE INTO podcasts (url, full, partial, avg_bw, total_bw, eq_full, feature, code, sheet_name, year, month, date, title)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            row["url"], row["full"], row["partial"], row["avg_bw"], row["total_bw"], row["eq_full"], row["feature"],
-            row["code"], row["sheet_name"], row["year"], row["month"], row["date"], row["title"]
-        ))
-        if c.rowcount > 0:
-            inserted_count += 1
-
-    conn.commit()
+    deduped.drop(columns=["dupe_key"], inplace=True)
+    deduped.to_sql("podcasts", conn, if_exists="replace", index=False)
     conn.close()
 
-    print(f"✅ Inserted {inserted_count} new rows")
-    print(f"🗂️  Duplicates logged: {len(duplicate_rows)}")
-    print(f"🚫 Skipped rows: {len(skipped)}")
+    print(f"✅ Imported {len(deduped)} new rows (deduplicated by URL + sheet-derived year)")
+    print(f"🗂️  Duplicates logged: {len(dups)}")
+    print(f"🚫 Skipped rows: {skipped_rows}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("path", help="Excel file to import")
+    parser.add_argument("--override-db", action="store_true", help="Delete and recreate podcasts.db before import")
+    args = parser.parse_args()
+    import_from_excel(args.path, override_db=args.override_db)
